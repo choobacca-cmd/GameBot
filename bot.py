@@ -374,7 +374,7 @@ class MatchmakingView(View):
                         team_b.append(remaining_players[i])
             
             # MAP VOTING
-            maps = ["Mirage", "Inferno", "Dust2", "Overpass", "Nuke", "Vertigo", "Ancient"]
+            maps = ["Urban", "Air Force", "Sandstorm", "Rampage", "District", "Iraq", "Morocco"]
             selected_map = await self.start_vote(
                 match_channel,
                 "🗺️ Map Voting",
