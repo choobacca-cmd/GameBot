@@ -7,42 +7,66 @@ import random
 import asyncio
 from typing import List, Dict, Optional, Tuple
 from discord.ui import View as DiscordView
+from contextlib import contextmanager
 
-# Database setup
+# Database setup and connection management
+@contextmanager
+def get_db_connection():
+    """Yield a database connection with proper error handling"""
+    conn = None
+    try:
+        conn = sqlite3.connect('elo_bot.db', timeout=10, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")  # Enable Write-Ahead Logging
+        yield conn
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
+
+@contextmanager
+def get_db_cursor():
+    """Yield a database cursor with proper error handling"""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        try:
+            yield cursor
+            conn.commit()
+        except:
+            conn.rollback()
+            raise
+
 def init_db():
-    conn = sqlite3.connect('elo_bot.db')
-    c = conn.cursor()
-    # Drop old table if exists
-    c.execute("DROP TABLE IF EXISTS queue")
-    
-    # Create new tables with required columns
-    c.execute('''CREATE TABLE queue
-                 (user_id INTEGER PRIMARY KEY,
-                  username TEXT,
-                  queue_type TEXT)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS players
-                 (user_id INTEGER PRIMARY KEY, 
-                  username TEXT, 
-                  elo INTEGER DEFAULT 0,
-                  wins INTEGER DEFAULT 0,
-                  losses INTEGER DEFAULT 0)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS matches
-                 (match_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                  team_a_players TEXT,
-                  team_b_players TEXT,
-                  winning_team TEXT,
-                  map_played TEXT,
-                  disputed BOOLEAN DEFAULT FALSE)''')
-    
-    c.execute('''CREATE TABLE IF NOT EXISTS level_roles
-                 (level INTEGER PRIMARY KEY,
-                  role_id INTEGER)''')
-    
-    conn.commit()
-    conn.close()
+    with get_db_cursor() as c:
+        # Drop old table if exists
+        c.execute("DROP TABLE IF EXISTS queue")
+        
+        # Create new tables with required columns
+        c.execute('''CREATE TABLE queue
+                     (user_id INTEGER PRIMARY KEY,
+                      username TEXT,
+                      queue_type TEXT)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS players
+                     (user_id INTEGER PRIMARY KEY, 
+                      username TEXT, 
+                      elo INTEGER DEFAULT 0,
+                      wins INTEGER DEFAULT 0,
+                      losses INTEGER DEFAULT 0)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS matches
+                     (match_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                      team_a_players TEXT,
+                      team_b_players TEXT,
+                      winning_team TEXT,
+                      map_played TEXT,
+                      disputed BOOLEAN DEFAULT FALSE)''')
+        
+        c.execute('''CREATE TABLE IF NOT EXISTS level_roles
+                     (level INTEGER PRIMARY KEY,
+                      role_id INTEGER)''')
 
 init_db()
 
@@ -117,17 +141,18 @@ class MatchmakingView(View):
         self.queue_message = None
     
     async def update_queue_embed(self):
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        c.execute("SELECT COUNT(*) FROM queue WHERE queue_type=?", (self.queue_type,))
-        queue_size = c.fetchone()[0]
-        required = QUEUE_TYPES[self.queue_type]["total_players"]
-        
-        c.execute("SELECT username FROM queue WHERE queue_type=?", (self.queue_type,))
-        players = c.fetchall()
-        player_list = "\n".join([f"• {p[0]}" for p in players]) if players else "No players yet"
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("SELECT COUNT(*) FROM queue WHERE queue_type=?", (self.queue_type,))
+                queue_size = c.fetchone()[0]
+                required = QUEUE_TYPES[self.queue_type]["total_players"]
+                
+                c.execute("SELECT username FROM queue WHERE queue_type=?", (self.queue_type,))
+                players = c.fetchall()
+                player_list = "\n".join([f"• {p[0]}" for p in players]) if players else "No players yet"
+        except sqlite3.Error as e:
+            print(f"Error updating queue embed: {e}")
+            return
         
         embed = discord.Embed(
             title=f"⚔️ {self.queue_type} Matchmaking Queue",
@@ -141,43 +166,46 @@ class MatchmakingView(View):
             try:
                 await self.queue_message.edit(embed=embed, view=self)
             except Exception as e:
-                print(f"Error updating queue embed: {e}")
+                print(f"Error updating queue message: {e}")
     
     @discord.ui.button(label="Join Queue", style=discord.ButtonStyle.green, custom_id="join_queue")
     async def join_queue(self, interaction: discord.Interaction, button: Button):
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        # Remove player from all queues first
-        c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
-        
-        # Add player to this queue
-        c.execute("INSERT INTO queue (user_id, username, queue_type) VALUES (?, ?, ?)",
-                  (interaction.user.id, str(interaction.user), self.queue_type))
-        conn.commit()
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                # Remove player from all queues first
+                c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
+                
+                # Add player to this queue
+                c.execute("INSERT INTO queue (user_id, username, queue_type) VALUES (?, ?, ?)",
+                          (interaction.user.id, str(interaction.user), self.queue_type))
+        except sqlite3.Error as e:
+            print(f"Database error in join_queue: {e}")
+            await interaction.response.send_message("Error joining queue. Please try again.", ephemeral=True)
+            return
         
         await self.update_queue_embed()
         await interaction.response.send_message(f"You joined {self.queue_type} queue!", ephemeral=True)
         
         # Check if queue is full and start match
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        c.execute("SELECT COUNT(*) FROM queue WHERE queue_type=?", (self.queue_type,))
-        queue_size = c.fetchone()[0]
-        conn.close()
-        
-        if queue_size >= QUEUE_TYPES[self.queue_type]["total_players"]:
-            await self.start_match(interaction)
+        try:
+            with get_db_cursor() as c:
+                c.execute("SELECT COUNT(*) FROM queue WHERE queue_type=?", (self.queue_type,))
+                queue_size = c.fetchone()[0]
+                
+            if queue_size >= QUEUE_TYPES[self.queue_type]["total_players"]:
+                await self.start_match(interaction)
+        except sqlite3.Error as e:
+            print(f"Error checking queue size: {e}")
     
     @discord.ui.button(label="Leave Queue", style=discord.ButtonStyle.red, custom_id="leave_queue")
     async def leave_queue(self, interaction: discord.Interaction, button: Button):
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
-        conn.commit()
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
+        except sqlite3.Error as e:
+            print(f"Database error in leave_queue: {e}")
+            await interaction.response.send_message("Error leaving queue. Please try again.", ephemeral=True)
+            return
         
         await self.update_queue_embed()
         await interaction.response.send_message(f"You left {self.queue_type} queue.", ephemeral=True)
@@ -224,41 +252,54 @@ class MatchmakingView(View):
             return random.choice(options)
     
     async def update_player_role(self, guild, player_id, new_elo):
-        member = guild.get_member(player_id)
-        if not member:
-            return
-        
-        # Remove old level roles
-        for level_data in ELO_LEVELS.values():
-            if level_data["role_id"]:
-                role = guild.get_role(level_data["role_id"])
-                if role and role in member.roles:
-                    await member.remove_roles(role)
-        
-        # Add new role based on new elo
-        for level, level_data in sorted(ELO_LEVELS.items(), key=lambda x: x[0], reverse=True):
-            if new_elo >= level_data["min_elo"]:
+        try:
+            member = guild.get_member(player_id)
+            if not member:
+                return
+            
+            # Remove old level roles
+            for level_data in ELO_LEVELS.values():
                 if level_data["role_id"]:
-                    role = guild.get_role(level_data["role_id"])
-                    if role:
-                        await member.add_roles(role)
-                break
+                    try:
+                        role = guild.get_role(level_data["role_id"])
+                        if role and role in member.roles:
+                            await member.remove_roles(role)
+                    except discord.Forbidden:
+                        print(f"Missing permissions to remove role for {member}")
+                    except discord.HTTPException as e:
+                        print(f"Error removing role: {e}")
+            
+            # Add new role based on new elo
+            for level, level_data in sorted(ELO_LEVELS.items(), key=lambda x: x[0], reverse=True):
+                if new_elo >= level_data["min_elo"]:
+                    if level_data["role_id"]:
+                        try:
+                            role = guild.get_role(level_data["role_id"])
+                            if role and role not in member.roles:
+                                await member.add_roles(role)
+                        except discord.Forbidden:
+                            print(f"Missing permissions to add role for {member}")
+                        except discord.HTTPException as e:
+                            print(f"Error adding role: {e}")
+                    break
+        except Exception as e:
+            print(f"Error in update_player_role: {e}")
     
     async def start_match(self, interaction: discord.Interaction):
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        c.execute("SELECT * FROM queue WHERE queue_type=?", (self.queue_type,))
-        queue_players = c.fetchall()
-        
-        if len(queue_players) < QUEUE_TYPES[self.queue_type]["total_players"]:
-            await interaction.followup.send("Not enough players in queue!", ephemeral=True)
-            conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("SELECT * FROM queue WHERE queue_type=?", (self.queue_type,))
+                queue_players = c.fetchall()
+                
+                if len(queue_players) < QUEUE_TYPES[self.queue_type]["total_players"]:
+                    await interaction.followup.send("Not enough players in queue!", ephemeral=True)
+                    return
+                
+                c.execute("DELETE FROM queue WHERE queue_type=?", (self.queue_type,))
+        except sqlite3.Error as e:
+            print(f"Database error in start_match: {e}")
+            await interaction.followup.send("Error starting match. Please try again.", ephemeral=True)
             return
-        
-        c.execute("DELETE FROM queue WHERE queue_type=?", (self.queue_type,))
-        conn.commit()
-        conn.close()
         
         await self.update_queue_embed()
         
@@ -273,12 +314,12 @@ class MatchmakingView(View):
             if member:
                 overwrites[member] = discord.PermissionOverwrite(read_messages=True)
         
-        match_channel = await guild.create_text_channel(
-            name=f"match-{self.queue_type}-{random.randint(1000, 9999)}",
-            overwrites=overwrites
-        )
-        
         try:
+            match_channel = await guild.create_text_channel(
+                name=f"match-{self.queue_type}-{random.randint(1000, 9999)}",
+                overwrites=overwrites
+            )
+            
             player_names = [p[1] for p in queue_players]
             player_ids = [p[0] for p in queue_players]
             
@@ -423,15 +464,17 @@ class MatchmakingView(View):
             await match_channel.send(embed=embed)
             
             # Save match to database
-            conn = sqlite3.connect('elo_bot.db')
-            c = conn.cursor()
-            c.execute(
-                "INSERT INTO matches (team_a_players, team_b_players, map_played) VALUES (?, ?, ?)",
-                (','.join(map(str, team_a)), ','.join(map(str, team_b)), selected_map)
-            )
-            match_id = c.lastrowid
-            conn.commit()
-            conn.close()
+            try:
+                with get_db_cursor() as c:
+                    c.execute(
+                        "INSERT INTO matches (team_a_players, team_b_players, map_played) VALUES (?, ?, ?)",
+                        (','.join(map(str, team_a)), ','.join(map(str, team_b)), selected_map)
+                    )
+                    match_id = c.lastrowid
+            except sqlite3.Error as e:
+                print(f"Error saving match to database: {e}")
+                await match_channel.send("Error saving match data. Results may not be recorded properly.")
+                return
             
             voting_view = MatchResultView(
                 bot=self.bot,
@@ -480,95 +523,120 @@ class MatchResultView(View):
             await interaction.response.send_message("You weren't in this match!", ephemeral=True)
             return
         
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        c.execute("SELECT winning_team FROM matches WHERE match_id=?", (self.match_id,))
-        result = c.fetchone()
-        if result and result[0] is not None:
-            await interaction.response.send_message("Result already recorded!", ephemeral=True)
-            conn.close()
-            return
-        
-        # Update match result
-        c.execute(
-            "UPDATE matches SET winning_team=? WHERE match_id=?",
-            (winning_team, self.match_id)
-        )
-        
-        # Determine winners and losers
-        winners = self.team_a if winning_team == "A" else self.team_b
-        losers = self.team_b if winning_team == "A" else self.team_a
-        
-        # Update player ELO and stats
-        for player_id in winners:
+        conn = None
+        try:
+            conn = sqlite3.connect('elo_bot.db', timeout=10, check_same_thread=False)
+            c = conn.cursor()
+            
+            # Check if result already recorded
+            c.execute("SELECT winning_team FROM matches WHERE match_id=?", (self.match_id,))
+            result = c.fetchone()
+            if result and result[0] is not None:
+                await interaction.response.send_message("Result already recorded!", ephemeral=True)
+                return
+            
+            # Update match result
             c.execute(
-                "UPDATE players SET elo=elo+25, wins=wins+1 WHERE user_id=?",
-                (player_id,)
-            )
-            c.execute("SELECT elo FROM players WHERE user_id=?", (player_id,))
-            new_elo = c.fetchone()[0]
-            await self.update_player_role(interaction.guild, player_id, new_elo)
-        
-        for player_id in losers:
-            c.execute(
-                "UPDATE players SET elo=elo-25, losses=losses+1 WHERE user_id=?",
-                (player_id,)
-            )
-            c.execute("SELECT elo FROM players WHERE user_id=?", (player_id,))
-            new_elo = c.fetchone()[0]
-            await self.update_player_role(interaction.guild, player_id, new_elo)
-        
-        conn.commit()
-        
-        # Send results to admin channel
-        if self.admin_channel:
-            c.execute("SELECT map_played FROM matches WHERE match_id=?", (self.match_id,))
-            map_played = c.fetchone()[0]
-            
-            embed = discord.Embed(
-                title="🏆 Match Results",
-                color=0x00ff00
+                "UPDATE matches SET winning_team=? WHERE match_id=?",
+                (winning_team, self.match_id)
             )
             
-            embed.add_field(
-                name=f"Team {winning_team} Won",
-                value=f"**Map:** {map_played}",
-                inline=False
-            )
+            # Determine winners and losers
+            winners = self.team_a if winning_team == "A" else self.team_b
+            losers = self.team_b if winning_team == "A" else self.team_a
             
-            # Team A text with ELO changes
-            team_a_text = []
-            for p in self.team_a:
-                c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
-                row = c.fetchone()
-                if row:
-                    username, elo = row
-                    change = "+25" if p in winners else "-25"
-                    team_a_text.append(f"{username} - {elo} ({change})")
+            # Update player ELO and stats - with existence check
+            for player_id in winners + losers:
+                # First ensure player exists
+                c.execute("SELECT 1 FROM players WHERE user_id=?", (player_id,))
+                if not c.fetchone():
+                    member = interaction.guild.get_member(player_id)
+                    username = str(member) if member else f"Unknown User {player_id}"
+                    c.execute(
+                        "INSERT INTO players (user_id, username, elo, wins, losses) VALUES (?, ?, ?, ?, ?)",
+                        (player_id, username, 25 if player_id in winners else -25, 
+                         1 if player_id in winners else 0, 0 if player_id in winners else 1)
+                    )
+                else:
+                    # Update existing player
+                    c.execute(
+                        "UPDATE players SET elo=elo+?, wins=wins+?, losses=losses+? WHERE user_id=?",
+                        (25 if player_id in winners else -25, 
+                         1 if player_id in winners else 0,
+                         0 if player_id in winners else 1,
+                         player_id)
+                    )
+                
+                # Get new ELO for role update
+                c.execute("SELECT elo FROM players WHERE user_id=?", (player_id,))
+                elo_result = c.fetchone()
+                if elo_result:
+                    await self.update_player_role(interaction.guild, player_id, elo_result[0])
             
-            # Team B text with ELO changes
-            team_b_text = []
-            for p in self.team_b:
-                c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
-                row = c.fetchone()
-                if row:
-                    username, elo = row
-                    change = "+25" if p in winners else "-25"
-                    team_b_text.append(f"{username} - {elo} ({change})")
+            conn.commit()
             
-            embed.add_field(name="Team A", value="\n".join(team_a_text), inline=True)
-            embed.add_field(name="Team B", value="\n".join(team_b_text), inline=True)
-            
-            admin_channel_obj = interaction.guild.get_channel(self.admin_channel)
-            if admin_channel_obj:
-                await admin_channel_obj.send(embed=embed)
-            
-            # Update leaderboard
-            if self.leaderboard_channel:
-                await self.update_leaderboard(self.leaderboard_channel)
+            # Send results to admin channel
+            if self.admin_channel:
+                c.execute("SELECT map_played FROM matches WHERE match_id=?", (self.match_id,))
+                map_played = c.fetchone()[0]
+                
+                embed = discord.Embed(
+                    title="🏆 Match Results",
+                    color=0x00ff00
+                )
+                
+                embed.add_field(
+                    name=f"Team {winning_team} Won",
+                    value=f"**Map:** {map_played}",
+                    inline=False
+                )
+                
+                # Team A text with ELO changes
+                team_a_text = []
+                for p in self.team_a:
+                    c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
+                    row = c.fetchone()
+                    if row:
+                        username, elo = row
+                        change = "+25" if p in winners else "-25"
+                        team_a_text.append(f"{username} - {elo} ({change})")
+                
+                # Team B text with ELO changes
+                team_b_text = []
+                for p in self.team_b:
+                    c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
+                    row = c.fetchone()
+                    if row:
+                        username, elo = row
+                        change = "+25" if p in winners else "-25"
+                        team_b_text.append(f"{username} - {elo} ({change})")
+                
+                embed.add_field(name="Team A", value="\n".join(team_a_text), inline=True)
+                embed.add_field(name="Team B", value="\n".join(team_b_text), inline=True)
+                
+                admin_channel_obj = interaction.guild.get_channel(self.admin_channel)
+                if admin_channel_obj:
+                    await admin_channel_obj.send(embed=embed)
+                
+                # Update leaderboard
+                if self.leaderboard_channel:
+                    await self.update_leaderboard(self.leaderboard_channel)
         
-        conn.close()
+        except sqlite3.Error as e:
+            print(f"Database error: {e}")
+            await interaction.response.send_message(
+                "❌ Database error occurred while processing results.",
+                ephemeral=True
+            )
+        except Exception as e:
+            print(f"Error in process_result: {e}")
+            await interaction.response.send_message(
+                "❌ An error occurred while processing results.",
+                ephemeral=True
+            )
+        finally:
+            if conn:
+                conn.close()
         
         # Delete match channels
         try:
@@ -584,26 +652,34 @@ class MatchResultView(View):
         )
     
     async def update_player_role(self, guild, player_id, new_elo):
-        member = guild.get_member(player_id)
-        if not member:
-            return
-        
-        # Remove all old level roles
-        for level_data in ELO_LEVELS.values():
-            if level_data["role_id"]:
-                role = guild.get_role(level_data["role_id"])
-                if role and role in member.roles:
-                    await member.remove_roles(role)
-        
-        # Add new role based on ELO (sorted in descending order)
-        for level in sorted(ELO_LEVELS.keys(), reverse=True):
-            level_data = ELO_LEVELS[level]
-            if new_elo >= level_data["min_elo"]:
+        try:
+            member = guild.get_member(player_id)
+            if not member:
+                return
+            
+            # Remove all old level roles
+            for level_data in ELO_LEVELS.values():
                 if level_data["role_id"]:
-                    role = guild.get_role(level_data["role_id"])
-                    if role:
-                        await member.add_roles(role)
-                break
+                    try:
+                        role = guild.get_role(level_data["role_id"])
+                        if role and role in member.roles:
+                            await member.remove_roles(role)
+                    except discord.Forbidden:
+                        print(f"Missing permissions to remove role for {member}")
+                    except discord.HTTPException as e:
+                        print(f"Error removing role: {e}")
+            
+            # Add new role based on ELO (sorted in descending order)
+            for level in sorted(ELO_LEVELS.keys(), reverse=True):
+                level_data = ELO_LEVELS[level]
+                if new_elo >= level_data["min_elo"]:
+                    if level_data["role_id"]:
+                        role = guild.get_role(level_data["role_id"])
+                        if role:
+                            await member.add_roles(role)
+                    break
+        except Exception as e:
+            print(f"Error in update_player_role: {e}")
     
     async def update_leaderboard(self, channel_id):
         guild = self.bot.get_guild(ADMIN_CHANNEL) if ADMIN_CHANNEL else None
@@ -614,12 +690,13 @@ class MatchResultView(View):
         if not channel:
             return
             
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        
-        c.execute("SELECT username, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
-        top_players = c.fetchall()
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("SELECT username, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
+                top_players = c.fetchall()
+        except sqlite3.Error as e:
+            print(f"Error fetching leaderboard data: {e}")
+            return
         
         embed = discord.Embed(
             title="🏆 Leaderboard - Top 10 Players",
@@ -635,15 +712,21 @@ class MatchResultView(View):
             )
         
         # Delete old leaderboard messages
-        async for message in channel.history(limit=10):
-            if message.author == self.bot.user and message.embeds:
-                if message.embeds[0].title.startswith("🏆 Leaderboard"):
-                    try:
-                        await message.delete()
-                    except:
-                        pass
+        try:
+            async for message in channel.history(limit=10):
+                if message.author == self.bot.user and message.embeds:
+                    if message.embeds[0].title.startswith("🏆 Leaderboard"):
+                        try:
+                            await message.delete()
+                        except:
+                            pass
+        except Exception as e:
+            print(f"Error cleaning up old leaderboard: {e}")
         
-        await channel.send(embed=embed)
+        try:
+            await channel.send(embed=embed)
+        except Exception as e:
+            print(f"Error sending leaderboard: {e}")
     
     @discord.ui.button(label="Team A Won", style=discord.ButtonStyle.green)
     async def team_a_won(self, interaction: discord.Interaction, button: Button):
@@ -655,11 +738,13 @@ class MatchResultView(View):
     
     @discord.ui.button(label="Dispute Result", style=discord.ButtonStyle.gray)
     async def dispute_result(self, interaction: discord.Interaction, button: Button):
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        c.execute("UPDATE matches SET disputed=1 WHERE match_id=?", (self.match_id,))
-        conn.commit()
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("UPDATE matches SET disputed=1 WHERE match_id=?", (self.match_id,))
+        except sqlite3.Error as e:
+            print(f"Error marking match as disputed: {e}")
+            await interaction.response.send_message("Error disputing match result.", ephemeral=True)
+            return
         
         if self.admin_results and self.admin_channel:
             guild = interaction.guild
@@ -770,14 +855,11 @@ class EloBot(commands.Bot):
                         ELO_LEVELS[level]["role_id"] = role.id
                         
                         # Store role ID in database
-                        conn = sqlite3.connect('elo_bot.db')
-                        c = conn.cursor()
-                        c.execute(
-                            "INSERT OR REPLACE INTO level_roles VALUES (?, ?)",
-                            (level, role.id)
-                        )
-                        conn.commit()
-                        conn.close()
+                        with get_db_cursor() as c:
+                            c.execute(
+                                "INSERT OR REPLACE INTO level_roles VALUES (?, ?)",
+                                (level, role.id)
+                            )
                     except Exception as e:
                         print(f"Error creating role Level {level}: {e}")
         
@@ -791,13 +873,14 @@ class EloBot(commands.Bot):
         init_db()
         
         # Load role IDs from database
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
-        c.execute("SELECT * FROM level_roles")
-        for level, role_id in c.fetchall():
-            if level in ELO_LEVELS:
-                ELO_LEVELS[level]["role_id"] = role_id
-        conn.close()
+        try:
+            with get_db_cursor() as c:
+                c.execute("SELECT * FROM level_roles")
+                for level, role_id in c.fetchall():
+                    if level in ELO_LEVELS:
+                        ELO_LEVELS[level]["role_id"] = role_id
+        except sqlite3.Error as e:
+            print(f"Error loading role IDs: {e}")
         
         # Sync commands
         try:
@@ -815,73 +898,61 @@ async def register(interaction: discord.Interaction):
     UNREGISTERED_ROLE_ID = 1396072475053265008  # Replace with unregistered role ID if exists
 
     try:
-        conn = sqlite3.connect('elo_bot.db')
-        c = conn.cursor()
+        with get_db_cursor() as c:
+            # Check if player is already registered
+            c.execute("SELECT * FROM players WHERE user_id=?", (interaction.user.id,))
+            if c.fetchone():
+                await interaction.response.send_message("⚠️ You're already registered!", ephemeral=True)
+                return
 
-        # Check if player is already registered
-        c.execute("SELECT * FROM players WHERE user_id=?", (interaction.user.id,))
-        if c.fetchone():
-            await interaction.response.send_message("⚠️ You're already registered!", ephemeral=True)
-            conn.close()
-            return
-
-        # Add player to database with 0 ELO
-        c.execute(
-            "INSERT INTO players (user_id, username, elo, wins, losses) VALUES (?, ?, 0, 0, 0)",
-            (interaction.user.id, str(interaction.user))
-        )
-        conn.commit()
-        conn.close()
-
-        # Get role objects
-        registered_role = interaction.guild.get_role(REGISTERED_ROLE_ID)
-        unregistered_role = interaction.guild.get_role(UNREGISTERED_ROLE_ID) if UNREGISTERED_ROLE_ID else None
-
-        # Change roles
-        try:
-            if unregistered_role and unregistered_role in interaction.user.roles:
-                await interaction.user.remove_roles(unregistered_role)
-            
-            if registered_role:
-                await interaction.user.add_roles(registered_role)
-        except discord.Forbidden:
-            print(f"Missing permissions to manage roles for {interaction.user}")
-        except discord.HTTPException as e:
-            print(f"Error changing roles: {e}")
-
-        # Confirm registration
-        await interaction.response.send_message(
-            "✅ Successfully registered! You now have 0 ELO and access to matchmaking.",
-            ephemeral=True
-        )
-
-        # Additional debug logging
-        print(f"New player registered: {interaction.user} (ID: {interaction.user.id})")
-
+            # Add player to database with 0 ELO
+            c.execute(
+                "INSERT INTO players (user_id, username, elo, wins, losses) VALUES (?, ?, 0, 0, 0)",
+                (interaction.user.id, str(interaction.user))
+            )
     except sqlite3.Error as e:
         print(f"Database error during registration: {e}")
         await interaction.response.send_message(
             "❌ Database error during registration. Please try again or contact admin.",
             ephemeral=True
         )
-        if conn:
-            conn.close()
+        return
 
-    except Exception as e:
-        print(f"Unexpected error in register command: {e}")
-        await interaction.response.send_message(
-            "❌ An unexpected error occurred. Please contact admin.",
-            ephemeral=True
-        )
+    # Get role objects
+    registered_role = interaction.guild.get_role(REGISTERED_ROLE_ID)
+    unregistered_role = interaction.guild.get_role(UNREGISTERED_ROLE_ID) if UNREGISTERED_ROLE_ID else None
+
+    # Change roles
+    try:
+        if unregistered_role and unregistered_role in interaction.user.roles:
+            await interaction.user.remove_roles(unregistered_role)
+        
+        if registered_role:
+            await interaction.user.add_roles(registered_role)
+    except discord.Forbidden:
+        print(f"Missing permissions to manage roles for {interaction.user}")
+    except discord.HTTPException as e:
+        print(f"Error changing roles: {e}")
+
+    # Confirm registration
+    await interaction.response.send_message(
+        "✅ Successfully registered! You now have 0 ELO and access to matchmaking.",
+        ephemeral=True
+    )
+
+    # Additional debug logging
+    print(f"New player registered: {interaction.user} (ID: {interaction.user.id})")
 
 @bot.tree.command(name="leaderboard", description="Show top 10 players by ELO")
 async def leaderboard(interaction: discord.Interaction):
-    conn = sqlite3.connect('elo_bot.db')
-    c = conn.cursor()
-    
-    c.execute("SELECT username, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
-    top_players = c.fetchall()
-    conn.close()
+    try:
+        with get_db_cursor() as c:
+            c.execute("SELECT username, elo, wins, losses FROM players ORDER BY elo DESC LIMIT 10")
+            top_players = c.fetchall()
+    except sqlite3.Error as e:
+        print(f"Error fetching leaderboard: {e}")
+        await interaction.response.send_message("Error loading leaderboard. Please try again.", ephemeral=True)
+        return
     
     if not top_players:
         await interaction.response.send_message("No players registered yet!", ephemeral=True)
@@ -904,12 +975,14 @@ async def leaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="profile", description="Show your ELO profile")
 async def profile(interaction: discord.Interaction):
-    conn = sqlite3.connect('elo_bot.db')
-    c = conn.cursor()
-    
-    c.execute("SELECT elo, wins, losses FROM players WHERE user_id=?", (interaction.user.id,))
-    result = c.fetchone()
-    conn.close()
+    try:
+        with get_db_cursor() as c:
+            c.execute("SELECT elo, wins, losses FROM players WHERE user_id=?", (interaction.user.id,))
+            result = c.fetchone()
+    except sqlite3.Error as e:
+        print(f"Error fetching profile: {e}")
+        await interaction.response.send_message("Error loading profile. Please try again.", ephemeral=True)
+        return
     
     if not result:
         await interaction.response.send_message("You're not registered! Use `/register` first.", ephemeral=True)
@@ -959,14 +1032,16 @@ async def force_start(interaction: discord.Interaction, queue_type: str):
 @bot.tree.command(name="reset_elo", description="Reset a player's ELO (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def reset_elo(interaction: discord.Interaction, user: discord.Member):
-    conn = sqlite3.connect('elo_bot.db')
-    c = conn.cursor()
-    
-    c.execute(
-        "UPDATE players SET elo=0, wins=0, losses=0 WHERE user_id=?",
-        (user.id,)
-    )
-    conn.commit()
+    try:
+        with get_db_cursor() as c:
+            c.execute(
+                "UPDATE players SET elo=0, wins=0, losses=0 WHERE user_id=?",
+                (user.id,)
+            )
+    except sqlite3.Error as e:
+        print(f"Error resetting ELO: {e}")
+        await interaction.response.send_message("Error resetting ELO. Please try again.", ephemeral=True)
+        return
     
     # Reset role to Level 1
     if ELO_LEVELS[1]["role_id"]:
@@ -977,13 +1052,17 @@ async def reset_elo(interaction: discord.Interaction, user: discord.Member):
                 if level_data["role_id"] and level_data["role_id"] != ELO_LEVELS[1]["role_id"]:
                     role = interaction.guild.get_role(level_data["role_id"])
                     if role and role in user.roles:
-                        await user.remove_roles(role)
+                        try:
+                            await user.remove_roles(role)
+                        except:
+                            pass
             
             # Add Level 1 role
             if level_1_role not in user.roles:
-                await user.add_roles(level_1_role)
-    
-    conn.close()
+                try:
+                    await user.add_roles(level_1_role)
+                except:
+                    pass
     
     await interaction.response.send_message(
         f"Reset ELO for {user.mention} to 0 and set to Level 1.",
@@ -993,14 +1072,16 @@ async def reset_elo(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="set_elo", description="Set a player's ELO (Admin only)")
 @app_commands.checks.has_permissions(administrator=True)
 async def set_elo(interaction: discord.Interaction, user: discord.Member, elo: int):
-    conn = sqlite3.connect('elo_bot.db')
-    c = conn.cursor()
-    
-    c.execute(
-        "UPDATE players SET elo=? WHERE user_id=?",
-        (elo, user.id)
-    )
-    conn.commit()
+    try:
+        with get_db_cursor() as c:
+            c.execute(
+                "UPDATE players SET elo=? WHERE user_id=?",
+                (elo, user.id)
+            )
+    except sqlite3.Error as e:
+        print(f"Error setting ELO: {e}")
+        await interaction.response.send_message("Error setting ELO. Please try again.", ephemeral=True)
+        return
     
     # Update player role based on new ELO
     for level, level_data in sorted(ELO_LEVELS.items(), key=lambda x: x[0], reverse=True):
@@ -1013,14 +1094,18 @@ async def set_elo(interaction: discord.Interaction, user: discord.Member, elo: i
                         if other_level_data["role_id"] and other_level_data["role_id"] != level_data["role_id"]:
                             other_role = interaction.guild.get_role(other_level_data["role_id"])
                             if other_role and other_role in user.roles:
-                                await user.remove_roles(other_role)
+                                try:
+                                    await user.remove_roles(other_role)
+                                except:
+                                    pass
                     
                     # Add new role
                     if role not in user.roles:
-                        await user.add_roles(role)
+                        try:
+                            await user.add_roles(role)
+                        except:
+                            pass
                     break
-    
-    conn.close()
     
     await interaction.response.send_message(
         f"Set {user.mention}'s ELO to {elo} and updated their level role.",
