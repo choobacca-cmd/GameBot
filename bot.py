@@ -80,7 +80,7 @@ class QueueSelectView(View):
             discord.SelectOption(label="2v2", description="2 players per team", value="2v2"),
             discord.SelectOption(label="3v3", description="3 players per team", value="3v3"),
             discord.SelectOption(label="4v4", description="4 players per team", value="4v4"),
-            discord.SelectOption(label="5v5", description="5 players per team", value="5v5")
+            discord.SelectOption(label="5v5", description="5 players per team", value="5v5"),
         ]
         
         self.select = Select(
@@ -93,7 +93,7 @@ class QueueSelectView(View):
     
     async def queue_selected(self, interaction: discord.Interaction):
         queue_type = self.select.values[0]
-        # Створюємо красивий ембед для черги
+        
         embed = discord.Embed(
             title=f"⚔️ {queue_type} Matchmaking Queue",
             description=f"Click the buttons below to join or leave the {queue_type} queue",
@@ -101,13 +101,12 @@ class QueueSelectView(View):
         )
         embed.set_footer(text="Waiting for players...")
         
-        # Відправляємо нове повідомлення з View для черги
         view = MatchmakingView(self.bot, queue_type)
         await interaction.response.send_message(embed=embed, view=view)
         
-        # Оновлюємо повідомлення у View
         view.queue_message = await interaction.original_response()
         await view.update_queue_embed()
+
 
 class MatchmakingView(View):
     def __init__(self, bot, queue_type="4v4"):
@@ -140,31 +139,27 @@ class MatchmakingView(View):
         if self.queue_message:
             try:
                 await self.queue_message.edit(embed=embed, view=self)
-            except:
+            except Exception:
                 pass
     
     @discord.ui.button(label="Join Queue", style=discord.ButtonStyle.green, custom_id="join_queue")
     async def join_queue(self, interaction: discord.Interaction, button: Button):
         conn = sqlite3.connect('elo_bot.db')
         c = conn.cursor()
-    
-    # Видаляємо гравця з усіх черг (якщо він вже десь є)
-        c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
-    
-    # Додаємо в чергу з правильними даними
-        c.execute("INSERT INTO queue (user_id, username, queue_type) VALUES (?, ?, ?)",
-                (interaction.user.id, str(interaction.user), self.queue_type))
         
+        # Remove player from all queues first
+        c.execute("DELETE FROM queue WHERE user_id=?", (interaction.user.id,))
+        
+        # Add player to this queue
+        c.execute("INSERT INTO queue (user_id, username, queue_type) VALUES (?, ?, ?)",
+                  (interaction.user.id, str(interaction.user), self.queue_type))
         conn.commit()
         conn.close()
         
         await self.update_queue_embed()
-        await interaction.response.send_message(
-            f"You joined {self.queue_type} queue!", 
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"You joined {self.queue_type} queue!", ephemeral=True)
         
-        # Check if queue is full
+        # Check if queue is full and start match
         conn = sqlite3.connect('elo_bot.db')
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM queue WHERE queue_type=?", (self.queue_type,))
@@ -184,10 +179,7 @@ class MatchmakingView(View):
         conn.close()
         
         await self.update_queue_embed()
-        await interaction.response.send_message(
-            f"You left {self.queue_type} queue.", 
-            ephemeral=True
-        )
+        await interaction.response.send_message(f"You left {self.queue_type} queue.", ephemeral=True)
     
     async def get_reaction_users(self, reaction):
         users = []
@@ -235,14 +227,14 @@ class MatchmakingView(View):
         if not member:
             return
         
-        # Remove all old level roles
+        # Remove old level roles
         for level_data in ELO_LEVELS.values():
             if level_data["role_id"]:
                 role = guild.get_role(level_data["role_id"])
                 if role and role in member.roles:
                     await member.remove_roles(role)
         
-        # Add new role
+        # Add new role based on new elo
         for level, level_data in ELO_LEVELS.items():
             if new_elo >= level_data["min_elo"]:
                 if level_data["role_id"]:
@@ -286,25 +278,26 @@ class MatchmakingView(View):
         )
         
         try:
-            # CAPTAIN VOTING
             player_names = [p[1] for p in queue_players]
             player_ids = [p[0] for p in queue_players]
             
-            # Select 2 captains
-            captains = await self.start_vote(
+            # Captain voting
+            captains_vote = await self.start_vote(
                 match_channel,
                 "🛡️ Captain Voting",
                 "Vote for 2 captains:",
                 player_names
             )
             
-            # If voting failed, select random captains
-            if not captains or isinstance(captains, str):
+            if not captains_vote or isinstance(captains_vote, str):
+                captains = random.sample(player_names, 2)
+            else:
+                # If vote returns a single name, fallback random (can improve logic)
                 captains = random.sample(player_names, 2)
             
             captain_ids = [queue_players[player_names.index(name)][0] for name in captains]
             
-            # TEAM PICK STYLE VOTING
+            # Team pick style vote
             pick_style = await self.start_vote(
                 match_channel,
                 "⚙️ Team Pick Style",
@@ -317,16 +310,15 @@ class MatchmakingView(View):
             remaining_players = [p[0] for p in queue_players if p[0] not in captain_ids]
             
             if pick_style == "Team Pick (captains choose)":
-                # Team picking phase
-                turn = 0  # 0 for team A, 1 for team B
-                for _ in range(len(remaining_players)):
+                turn = 0
+                while remaining_players:
                     current_captain = team_a[0] if turn == 0 else team_b[0]
                     captain_member = guild.get_member(current_captain)
                     
                     if captain_member:
                         embed = discord.Embed(
                             title=f"Team {'A' if turn == 0 else 'B'} Captain's Turn",
-                            description=f"<@{current_captain}>, please pick a player by reacting:",
+                            description=f"<@{current_captain}>, pick a player by reacting:",
                             color=0x3498db
                         )
                         
@@ -336,7 +328,6 @@ class MatchmakingView(View):
                         
                         pick_msg = await match_channel.send(embed=embed)
                         
-                        # Add number reactions
                         for i in range(len(options)):
                             await pick_msg.add_reaction(f"{i+1}\N{variation selector-16}\N{combining enclosing keycap}")
                         
@@ -354,7 +345,7 @@ class MatchmakingView(View):
                                 team_b.append(picked_player)
                             
                             remaining_players.remove(picked_player)
-                            turn = 1 - turn  # Switch turn
+                            turn = 1 - turn
                             
                             await match_channel.send(f"<@{current_captain}> picked <@{picked_player}>!")
                         except asyncio.TimeoutError:
@@ -369,15 +360,13 @@ class MatchmakingView(View):
                             
                             await match_channel.send(f"Captain didn't pick in time! Randomly assigned <@{picked_player}>.")
             else:
-                # Random teams
                 random.shuffle(remaining_players)
-                for i in range(len(remaining_players)):
+                for i, p in enumerate(remaining_players):
                     if i % 2 == 0:
-                        team_a.append(remaining_players[i])
+                        team_a.append(p)
                     else:
-                        team_b.append(remaining_players[i])
+                        team_b.append(p)
             
-            # MAP VOTING
             maps = ["Urban", "Air Force", "Sandstorm", "Rampage", "District", "Iraq", "Morocco"]
             selected_map = await self.start_vote(
                 match_channel,
@@ -386,29 +375,19 @@ class MatchmakingView(View):
                 maps
             )
             
-            # ROOM CREATOR VOTING
-            creator = await self.start_vote(
+            creator_vote = await self.start_vote(
                 match_channel,
                 "👑 Room Creator Voting",
                 "Vote for room creator:",
                 player_names
             )
-            creator_id = queue_players[player_names.index(creator)][0] if creator in player_names else queue_players[0][0]
+            creator_id = queue_players[player_names.index(creator_vote)][0] if creator_vote in player_names else queue_players[0][0]
             
-            # FINAL PREPARATION
             password = ''.join(random.choices('ABCDEFGHJKLMNPQRSTUVWXYZ23456789', k=6))
             
-            team_a_channel = await guild.create_voice_channel(
-                name=f"Team A - {selected_map}",
-                overwrites=overwrites
-            )
+            team_a_channel = await guild.create_voice_channel(name=f"Team A - {selected_map}", overwrites=overwrites)
+            team_b_channel = await guild.create_voice_channel(name=f"Team B - {selected_map}", overwrites=overwrites)
             
-            team_b_channel = await guild.create_voice_channel(
-                name=f"Team B - {selected_map}",
-                overwrites=overwrites
-            )
-            
-            # Move players
             for player_id in team_a:
                 member = guild.get_member(player_id)
                 if member and member.voice:
@@ -425,38 +404,22 @@ class MatchmakingView(View):
                     except:
                         pass
             
-            # Final embed
             embed = discord.Embed(
                 title="🎮 Match Ready!",
                 description=f"**Map:** {selected_map} | **Mode:** {self.queue_type}",
                 color=0xf1c40f
             )
-            
-            embed.add_field(
-                name="Team A",
-                value="\n".join([f"<@{p}>" for p in team_a]),
-                inline=True
-            )
-            
-            embed.add_field(
-                name="Team B",
-                value="\n".join([f"<@{p}>" for p in team_b]),
-                inline=True
-            )
-            
+            embed.add_field(name="Team A", value="\n".join([f"<@{p}>" for p in team_a]), inline=True)
+            embed.add_field(name="Team B", value="\n".join([f"<@{p}>" for p in team_b]), inline=True)
             embed.add_field(
                 name="Match Details",
-                value=f"**Room Creator:** <@{creator_id}>\n"
-                     f"**Password:** ||{password}||\n"
-                     f"**Voice Channels:**\n"
-                     f"- {team_a_channel.mention}\n"
-                     f"- {team_b_channel.mention}",
+                value=f"**Room Creator:** <@{creator_id}>\n**Password:** ||{password}||\nVoice Channels:\n- {team_a_channel.mention}\n- {team_b_channel.mention}",
                 inline=False
             )
             
             await match_channel.send(embed=embed)
             
-            # Store match in database
+            # Збереження матчу в базі
             conn = sqlite3.connect('elo_bot.db')
             c = conn.cursor()
             c.execute(
@@ -467,24 +430,22 @@ class MatchmakingView(View):
             conn.commit()
             conn.close()
             
-            # Post-match voting after short delay
-            await asyncio.sleep(2)  # 2 second delay before result voting
+            voting_view = MatchResultView(
+                bot=self.bot,
+                match_id=match_id,
+                team_a=team_a,
+                team_b=team_b,
+                channel=match_channel,
+                team_a_voice=team_a_channel,
+                team_b_voice=team_b_channel
+            )
             
-            embed = discord.Embed(
-                title="🏆 Match Result",
+            await match_channel.send(embed=discord.Embed(
+                title="🏆 Match Result Voting",
                 description="Vote for the winning team:",
                 color=0x3498db
-            )
+            ), view=voting_view)
             
-            embed.add_field(name="Team A", value="\n".join([f"<@{p}>" for p in team_a]), inline=True)
-            embed.add_field(name="Team B", value="\n".join([f"<@{p}>" for p in team_b]), inline=True)
-            
-            voting_view = MatchResultView(
-                self.bot, match_id, team_a, team_b, 
-                match_channel, team_a_channel, team_b_channel
-            )
-            await match_channel.send(embed=embed, view=voting_view)
-                
         except Exception as e:
             print(f"Matchmaking error: {e}")
             try:
@@ -492,8 +453,9 @@ class MatchmakingView(View):
             except:
                 await interaction.followup.send(f"❌ Error occurred: {str(e)}", ephemeral=True)
 
+
 class MatchResultView(View):
-    def __init__(self, bot, match_id, team_a, team_b, match_channel, team_a_channel, team_b_channel):
+    def __init__(self, bot, match_id, team_a, team_b, match_channel, team_a_channel, team_b_channel, admin_channel=None, leaderboard_channel=None, admin_results=None):
         super().__init__(timeout=None)
         self.bot = bot
         self.match_id = match_id
@@ -502,8 +464,12 @@ class MatchResultView(View):
         self.match_channel = match_channel
         self.team_a_channel = team_a_channel
         self.team_b_channel = team_b_channel
+        self.admin_channel = admin_channel
+        self.leaderboard_channel = leaderboard_channel
+        self.admin_results = admin_results
     
     async def process_result(self, interaction: discord.Interaction, winning_team: str):
+        # Перевірка, чи юзер був у команді
         if interaction.user.id not in self.team_a + self.team_b:
             await interaction.response.send_message("You weren't in this match!", ephemeral=True)
             return
@@ -512,21 +478,23 @@ class MatchResultView(View):
         c = conn.cursor()
         
         c.execute("SELECT winning_team FROM matches WHERE match_id=?", (self.match_id,))
-        if c.fetchone()[0] is not None:
+        result = c.fetchone()
+        if result and result[0] is not None:
             await interaction.response.send_message("Result already recorded!", ephemeral=True)
             conn.close()
             return
         
-        # Update match result
+        # Оновлення результату матчу
         c.execute(
             "UPDATE matches SET winning_team=? WHERE match_id=?",
             (winning_team, self.match_id)
         )
         
-        # Update player stats and ELO
+        # Визначення переможців і програвших
         winners = self.team_a if winning_team == "A" else self.team_b
         losers = self.team_b if winning_team == "A" else self.team_a
         
+        # Оновлення ELO і статистики гравців
         for player_id in winners:
             c.execute(
                 "UPDATE players SET elo=elo+25, wins=wins+1 WHERE user_id=?",
@@ -547,8 +515,11 @@ class MatchResultView(View):
         
         conn.commit()
         
-        # Send results to admin channel
-        if admin_channel:
+        # Відправка результатів в адмін-канал
+        if self.admin_channel:
+            c.execute("SELECT map_played FROM matches WHERE match_id=?", (self.match_id,))
+            map_played = c.fetchone()[0]
+            
             embed = discord.Embed(
                 title="🏆 Match Results",
                 color=0x00ff00
@@ -556,37 +527,42 @@ class MatchResultView(View):
             
             embed.add_field(
                 name=f"Team {winning_team} Won",
-                value=f"**Map:** {c.execute('SELECT map_played FROM matches WHERE match_id=?', (self.match_id,)).fetchone()[0]}",
+                value=f"**Map:** {map_played}",
                 inline=False
             )
             
-            # Team A players with ELO changes
+            # Текст для команди А з ELO змінами
             team_a_text = []
             for p in self.team_a:
                 c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
-                username, elo = c.fetchone()
-                change = "+25" if p in winners else "-25"
-                team_a_text.append(f"{username} - {elo} ({change})")
+                row = c.fetchone()
+                if row:
+                    username, elo = row
+                    change = "+25" if p in winners else "-25"
+                    team_a_text.append(f"{username} - {elo} ({change})")
             
-            # Team B players with ELO changes
+            # Текст для команди Б з ELO змінами
             team_b_text = []
             for p in self.team_b:
                 c.execute("SELECT username, elo FROM players WHERE user_id=?", (p,))
-                username, elo = c.fetchone()
-                change = "+25" if p in winners else "-25"
-                team_b_text.append(f"{username} - {elo} ({change})")
+                row = c.fetchone()
+                if row:
+                    username, elo = row
+                    change = "+25" if p in winners else "-25"
+                    team_b_text.append(f"{username} - {elo} ({change})")
             
             embed.add_field(name="Team A", value="\n".join(team_a_text), inline=True)
             embed.add_field(name="Team B", value="\n".join(team_b_text), inline=True)
             
-            await admin_channel.send(embed=embed)
+            await self.admin_channel.send(embed=embed)
             
-            if leaderboard_channel:
-                await self.update_leaderboard(leaderboard_channel)
+            # Оновлення таблиці лідерів
+            if self.leaderboard_channel:
+                await self.update_leaderboard(self.leaderboard_channel)
         
         conn.close()
         
-        # Cleanup channels
+        # Видалення каналів матчу
         try:
             await self.match_channel.delete()
             await self.team_a_channel.delete()
@@ -604,15 +580,16 @@ class MatchResultView(View):
         if not member:
             return
         
-        # Remove all old level roles
+        # Видаляємо усі старі ролі рівнів
         for level_data in ELO_LEVELS.values():
             if level_data["role_id"]:
                 role = guild.get_role(level_data["role_id"])
                 if role and role in member.roles:
                     await member.remove_roles(role)
         
-        # Add new role
-        for level, level_data in ELO_LEVELS.items():
+        # Додаємо нову роль залежно від ELO (відсортовано за спаданням)
+        for level in sorted(ELO_LEVELS.keys(), reverse=True):
+            level_data = ELO_LEVELS[level]
             if new_elo >= level_data["min_elo"]:
                 if level_data["role_id"]:
                     role = guild.get_role(level_data["role_id"])
@@ -641,10 +618,11 @@ class MatchResultView(View):
                 inline=False
             )
         
-        # Delete old leaderboard message
+        # Видаляємо старі повідомлення з лідербордом
         async for message in channel.history(limit=10):
-            if message.author == self.bot.user and message.embeds and message.embeds[0].title.startswith("🏆 Leaderboard"):
-                await message.delete()
+            if message.author == self.bot.user and message.embeds:
+                if message.embeds[0].title.startswith("🏆 Leaderboard"):
+                    await message.delete()
         
         await channel.send(embed=embed)
     
@@ -663,7 +641,8 @@ class MatchResultView(View):
         c.execute("UPDATE matches SET disputed=1 WHERE match_id=?", (self.match_id,))
         conn.commit()
         conn.close()
-        if admin_results:
+        
+        if self.admin_results and self.admin_channel:
             embed = discord.Embed(
                 title="⚠️ Match Result Disputed",
                 description=f"Match ID: {self.match_id}\nDisputed by: {interaction.user.mention}",
@@ -684,9 +663,11 @@ class MatchResultView(View):
             
             admin_view = AdminMatchResultView(
                 self.bot, self.match_id, self.team_a, self.team_b,
-                self.match_channel, self.team_a_channel, self.team_b_channel
+                self.match_channel, self.team_a_channel, self.team_b_channel,
+                self.admin_channel, self.leaderboard_channel, self.admin_results
             )
-            await admin_channel.send(embed=embed, view=admin_view)
+            
+            await self.admin_channel.send(embed=embed, view=admin_view)
             
             await interaction.response.send_message(
                 "The match result has been disputed and sent to admins for review.",
@@ -699,8 +680,8 @@ class MatchResultView(View):
             )
 
 class AdminMatchResultView(View):
-    def __init__(self, bot, match_id, team_a, team_b, match_channel, team_a_channel, team_b_channel):
-        super().__init__()
+    def __init__(self, bot, match_id, team_a, team_b, match_channel, team_a_channel, team_b_channel, admin_channel=None, leaderboard_channel=None, admin_results=None):
+        super().__init__(timeout=None)
         self.bot = bot
         self.match_id = match_id
         self.team_a = team_a
@@ -708,22 +689,38 @@ class AdminMatchResultView(View):
         self.match_channel = match_channel
         self.team_a_channel = team_a_channel
         self.team_b_channel = team_b_channel
+        self.admin_channel = admin_channel
+        self.leaderboard_channel = leaderboard_channel
+        self.admin_results = admin_results
+    
+    async def _process_admin_result(self, interaction: discord.Interaction, winning_team: str):
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("You don't have permission!", ephemeral=True)
+            return
+        
+        # Створюємо екземпляр MatchResultView і викликаємо process_result
+        match_view = MatchResultView(
+            self.bot,
+            self.match_id,
+            self.team_a,
+            self.team_b,
+            self.match_channel,
+            self.team_a_channel,
+            self.team_b_channel,
+            admin_channel=self.admin_channel,
+            leaderboard_channel=self.leaderboard_channel,
+            admin_results=self.admin_results
+        )
+        await match_view.process_result(interaction, winning_team)
     
     @discord.ui.button(label="Confirm Team A Win", style=discord.ButtonStyle.green)
     async def confirm_team_a(self, interaction: discord.Interaction, button: Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You don't have permission!", ephemeral=True)
-            return
-        
-        await MatchResultView.process_result(self, interaction, "A")
+        await self._process_admin_result(interaction, "A")
     
     @discord.ui.button(label="Confirm Team B Win", style=discord.ButtonStyle.red)
     async def confirm_team_b(self, interaction: discord.Interaction, button: Button):
-        if not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("You don't have permission!", ephemeral=True)
-            return
-        
-        await MatchResultView.process_result(self, interaction, "B")
+        await self._process_admin_result(interaction, "B")
+
 
 class EloBot(commands.Bot):
     def __init__(self):
