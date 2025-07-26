@@ -1043,9 +1043,9 @@ if __name__ == "__main__":
     from dotenv import load_dotenv
     
     load_dotenv()
-    TOKEN = os.getenv('DISCORD_TOKEN')
+    TOKEN = os.getenv('TOKEN')
     
     if not TOKEN:
-        print("Error: DISCORD_TOKEN not found in environment variables or .env file")
+        print("Error: TOKEN not found in environment variables or .env file")
     else:
         bot.run(TOKEN)
