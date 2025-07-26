@@ -67,6 +67,10 @@ ELO_LEVELS = {
     10: {"min_elo": 2000,  "role_id": 1396074513568895099}
 }
 
+admin_results = 1398642394257428522
+admin_channel = 1397957346604351508
+leaderboard_channel = 1397979720645349549
+
 class QueueSelectView(View):
     def __init__(self, bot):
         super().__init__(timeout=None)
@@ -544,7 +548,6 @@ class MatchResultView(View):
         conn.commit()
         
         # Send results to admin channel
-        admin_channel = discord.utils.get(interaction.guild.channels, name="results")
         if admin_channel:
             embed = discord.Embed(
                 title="🏆 Match Results",
@@ -578,8 +581,6 @@ class MatchResultView(View):
             
             await admin_channel.send(embed=embed)
             
-            # Update leaderboard
-            leaderboard_channel = discord.utils.get(interaction.guild.channels, name="leaderboard")
             if leaderboard_channel:
                 await self.update_leaderboard(leaderboard_channel)
         
@@ -662,9 +663,7 @@ class MatchResultView(View):
         c.execute("UPDATE matches SET disputed=1 WHERE match_id=?", (self.match_id,))
         conn.commit()
         conn.close()
-        
-        admin_channel = discord.utils.get(interaction.guild.channels, name="admin-results")
-        if admin_channel:
+        if admin_results:
             embed = discord.Embed(
                 title="⚠️ Match Result Disputed",
                 description=f"Match ID: {self.match_id}\nDisputed by: {interaction.user.mention}",
